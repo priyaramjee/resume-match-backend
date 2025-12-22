@@ -1,134 +1,78 @@
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import google.generativeai as genai
 import os
-import json
+import google.generativeai as genai
 
-# -------------------------------------------------
-# App setup
-# -------------------------------------------------
-app = FastAPI(title="Resume Matcher API")
+app = FastAPI()
 
+# CORS (required for Lovable)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # OK for MVP
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# --------- Models ---------
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel("models/gemini-2.5-flash")
-
-# -------------------------------------------------
-# Request / Response Schemas
-# -------------------------------------------------
 class AnalyzeRequest(BaseModel):
     resume_text: str
     job_text: str
 
-class AnalyzeResponse(BaseModel):
-    match_score: int
-    missing_skills: list[str]
-    key_strengths: list[str]
-    improvement_suggestions: list[str]
 
-# -------------------------------------------------
-# Helper: Normalize skills (remove adjectives)
-# -------------------------------------------------
-def normalize_skills(skills: list[str]) -> list[str]:
-    """
-    Removes adjectives or non-skill tokens from missing_skills.
-    """
-    STOPWORDS = {
-        "strong", "advanced", "experienced", "expert",
-        "good", "solid", "hands-on", "proficient"
-    }
+# --------- Health check (VERY important) ---------
 
-    cleaned = []
-    for skill in skills:
-        s = skill.lower().strip()
-        if s in STOPWORDS:
-            continue
-        cleaned.append(skill)
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
-    return cleaned
 
-# -------------------------------------------------
-# Helper: Safe JSON parsing
-# -------------------------------------------------
-def parse_json_safely(text: str):
-    """
-    Ensures raw JSON can be parsed even if the model
-    accidentally adds formatting.
-    """
-    cleaned = text.strip()
+# --------- Analyze endpoint ---------
 
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("```")[1]
+@app.post("/analyze")
+def analyze_resume(payload: AnalyzeRequest):
 
-    return json.loads(cleaned)
+    try:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            return {
+                "error": "Missing GEMINI_API_KEY environment variable"
+            }
 
-# -------------------------------------------------
-# Core API Endpoint
-# -------------------------------------------------
-@app.post("/analyze", response_model=AnalyzeResponse)
-def analyze_resume(req: AnalyzeRequest):
-    prompt = f"""
-You are an expert resume reviewer and career coach.
+        # Initialize Gemini INSIDE the request (never at import time)
+        genai.configure(api_key=api_key)
+
+        model = genai.GenerativeModel("gemini-2.5-flash")
+
+        prompt = f"""
+You are an expert resume reviewer.
+
+Compare the resume and job description below and return STRICT JSON only
+with these keys:
+- match_score (number 0-100)
+- missing_skills (array of strings)
+- key_strengths (array of strings)
+- improvement_suggestions (array of strings)
 
 Resume:
-<<<
-{req.resume_text}
->>>
+{payload.resume_text}
 
 Job Description:
-<<<
-{req.job_text}
->>>
-
-Tasks:
-1. Give a match score from 0 to 100.
-2. Identify missing skills or keywords.
-3. Identify key strengths relevant to the role.
-4. Suggest 3 to 5 concrete resume improvements.
-
-CRITICAL INSTRUCTIONS:
-- Respond with RAW JSON only
-- Do NOT use markdown
-- Do NOT add explanations
-- Missing skills must be concrete nouns or technologies
-- Do NOT list adjectives (e.g. strong, advanced) as skills
-- If a skill exists but lacks depth, suggest improvement instead
-
-JSON schema:
-{{
-  "match_score": number,
-  "missing_skills": [string],
-  "key_strengths": [string],
-  "improvement_suggestions": [string]
-}}
+{payload.job_text}
 """
 
-    max_attempts = 2
+        response = model.generate_content(
+            prompt,
+            request_options={"timeout": 15}
+        )
 
-    for attempt in range(max_attempts):
-        try:
-            response = model.generate_content(prompt)
-            result = parse_json_safely(response.text)
+        text = response.text.strip()
 
-            # Normalize skills
-            result["missing_skills"] = normalize_skills(
-                result.get("missing_skills", [])
-            )
+        return text
 
-            return result
-
-        except Exception as e:
-            if attempt == max_attempts - 1:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"LLM processing failed: {str(e)}"
-                )
+    except Exception as e:
+        return {
+            "error": "Analysis failed",
+            "details": str(e)
+        }
