@@ -1,3 +1,5 @@
+print("🔥🔥🔥 NEW APP.PY LOADED 🔥🔥🔥")
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -58,18 +60,11 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 @app.post("/analyze")
 def analyze_resume(payload: AnalyzeRequest):
     return {
-        "match_score": 92,
-        "missing_skills": ["Python"],
-        "key_strengths": [
-            "Strong SQL experience",
-            "Databricks and cloud analytics background",
-            "Senior stakeholder management"
-        ],
-        "improvement_suggestions": [
-            "Add Python experience if applicable",
-            "Quantify business impact in recent roles"
-        ]
+        "fingerprint": "MOCK_ANALYZE_V1",
+        "resume": payload.resume_text,
+        "job": payload.job_text
     }
+
 
 You are an expert resume reviewer.
 
