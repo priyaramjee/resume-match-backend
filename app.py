@@ -65,9 +65,3 @@ def analyze_resume(payload: AnalyzeRequest):
         "job": payload.job_text
     }
 
-
-You are an expert resume reviewer.
-
-Compare the resume and the job description below.
-
-Return STRICT JSON only with
