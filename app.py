@@ -56,12 +56,20 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # --------------------
 # Analyze endpoint
 # --------------------
-
 @app.post("/analyze")
 def analyze_resume(payload: AnalyzeRequest):
     return {
-        "fingerprint": "MOCK_ANALYZE_V1",
-        "resume": payload.resume_text,
-        "job": payload.job_text
+        "match_score": 92,
+        "missing_skills": ["Python"],
+        "key_strengths": [
+            "Strong SQL experience",
+            "Databricks and cloud analytics background",
+            "Senior stakeholder management"
+        ],
+        "improvement_suggestions": [
+            "Add Python experience if applicable",
+            "Quantify business impact in recent roles"
+        ]
     }
+
 
