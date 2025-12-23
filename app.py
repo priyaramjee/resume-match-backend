@@ -9,58 +9,30 @@ import re
 from google import genai
 from google.genai.types import GenerateContentConfig
 
-# -------------------------------------------------
-# App setup
-# -------------------------------------------------
-
 app = FastAPI(title="Resume Match API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # OK for MVP
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# -------------------------------------------------
-# Request model
-# -------------------------------------------------
 
 class AnalyzeRequest(BaseModel):
     resume_text: str
     job_text: str
 
-# -------------------------------------------------
-# Health check
-# -------------------------------------------------
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# -------------------------------------------------
-# Thread pool (prevents blocking)
-# -------------------------------------------------
-
 executor = ThreadPoolExecutor(max_workers=2)
 
-# -------------------------------------------------
-# Helper: robust JSON extraction
-# -------------------------------------------------
-
 def extract_json(text: str) -> dict:
-    """
-    Extract the first JSON object found in the text.
-    Handles markdown fences and extra commentary.
-    """
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
-        raise ValueError("No JSON object found in Gemini output")
+        raise ValueError("No JSON found in Gemini output")
     return json.loads(match.group())
-
-# -------------------------------------------------
-# Gemini runner (off main thread)
-# -------------------------------------------------
 
 def run_gemini(resume_text: str, job_text: str) -> dict:
     api_key = os.getenv("GEMINI_API_KEY")
@@ -74,12 +46,14 @@ You are an expert resume reviewer.
 
 Compare the resume and job description below.
 
-Return ONLY a valid JSON object (no markdown, no explanations)
-with exactly these keys:
-- match_score (number 0-100)
-- missing_skills (array of strings)
-- key_strengths (array of strings)
-- improvement_suggestions (array of strings)
+Return ONLY a valid JSON object.
+Rules:
+- match_score: number between 0 and 100
+- missing_skills: max 5 items
+- key_strengths: max 5 items
+- improvement_suggestions: max 5 items
+- Use short phrases
+- Do NOT add extra keys or explanations
 
 Resume:
 {resume_text}
@@ -93,22 +67,20 @@ Job Description:
         contents=prompt,
         config=GenerateContentConfig(
             temperature=0.2,
-            max_output_tokens=600,
+            max_output_tokens=1000,
         ),
     )
 
     raw = response.text
     print("RAW GEMINI OUTPUT:\n", raw)
 
-    return extract_json(raw)
+    if raw.count("{") != raw.count("}"):
+        raise RuntimeError("Incomplete JSON returned by Gemini")
 
-# -------------------------------------------------
-# Analyze endpoint (SAFE + GUARANTEED RESPONSE)
-# -------------------------------------------------
+    return extract_json(raw)
 
 @app.post("/analyze")
 def analyze_resume(payload: AnalyzeRequest):
-
     future = executor.submit(
         run_gemini,
         payload.resume_text,
@@ -116,9 +88,8 @@ def analyze_resume(payload: AnalyzeRequest):
     )
 
     try:
-        result = future.result(timeout=12)
+        result = future.result(timeout=15)
 
-        # Always return UI-safe schema
         return {
             "match_score": result.get("match_score", 0),
             "missing_skills": result.get("missing_skills", []),
