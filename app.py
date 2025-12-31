@@ -8,44 +8,47 @@ import json
 from google import genai
 from google.genai.types import GenerateContentConfig, Schema
 
-# -------------------------------------------------
-# App setup
-# -------------------------------------------------
-
 app = FastAPI(title="Resume Match API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # OK for MVP
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# -------------------------------------------------
-# Request model
-# -------------------------------------------------
 
 class AnalyzeRequest(BaseModel):
     resume_text: str
     job_text: str
 
-# -------------------------------------------------
-# Health check
-# -------------------------------------------------
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# -------------------------------------------------
-# Thread pool (prevents blocking)
-# -------------------------------------------------
+@app.get("/version")
+def version():
+    return {"version": "retry-v3-with-fallback"}
 
 executor = ThreadPoolExecutor(max_workers=2)
 
-# -------------------------------------------------
-# Gemini runner (schema JSON + retry on bad JSON)
-# -------------------------------------------------
+def _call_gemini(client, prompt: str, schema: Schema, max_tokens: int = 500) -> str:
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=GenerateContentConfig(
+            temperature=0.2,
+            max_output_tokens=max_tokens,
+            response_mime_type="application/json",
+            response_schema=schema,
+        ),
+    )
+
+    raw = ""
+    for candidate in response.candidates:
+        for part in candidate.content.parts:
+            if getattr(part, "text", None):
+                raw += part.text
+    return raw.strip()
 
 def run_gemini(resume_text: str, job_text: str) -> dict:
     api_key = os.getenv("GEMINI_API_KEY")
@@ -54,7 +57,7 @@ def run_gemini(resume_text: str, job_text: str) -> dict:
 
     client = genai.Client(api_key=api_key)
 
-    schema = Schema(
+    full_schema = Schema(
         type="object",
         properties={
             "match_score": Schema(type="number"),
@@ -62,64 +65,64 @@ def run_gemini(resume_text: str, job_text: str) -> dict:
             "key_strengths": Schema(type="array", items=Schema(type="string")),
             "improvement_suggestions": Schema(type="array", items=Schema(type="string")),
         },
-        required=[
-            "match_score",
-            "missing_skills",
-            "key_strengths",
-            "improvement_suggestions",
-        ],
+        required=["match_score", "missing_skills", "key_strengths", "improvement_suggestions"],
     )
 
-    def call_model(extra_instruction: str = "") -> str:
-        prompt = (
-            "You are an expert resume reviewer.\n\n"
-            "Compare the resume and the job description.\n\n"
-            "Return JSON ONLY.\n"
-            "Limits:\n"
-            "- missing_skills: max 5 items\n"
-            "- key_strengths: max 4 items\n"
-            "- improvement_suggestions: max 4 items\n"
-            "- Each item max 8 words\n"
-            + extra_instruction +
-            "\n\n"
-            f"Resume:\n{resume_text}\n\n"
-            f"Job Description:\n{job_text}\n"
-        )
+    score_only_schema = Schema(
+        type="object",
+        properties={"match_score": Schema(type="number")},
+        required=["match_score"],
+    )
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=GenerateContentConfig(
-                temperature=0.2,
-                max_output_tokens=500,
-                response_mime_type="application/json",
-                response_schema=schema,
-            ),
-        )
-
-        raw = ""
-        for candidate in response.candidates:
-            for part in candidate.content.parts:
-                if getattr(part, "text", None):
-                    raw += part.text
-
-        return raw.strip()
+    base_prompt = (
+        "You are an expert resume reviewer.\n"
+        "Return JSON ONLY.\n"
+        "Limits:\n"
+        "- missing_skills: max 5 items\n"
+        "- key_strengths: max 4 items\n"
+        "- improvement_suggestions: max 4 items\n"
+        "- Each item max 8 words\n\n"
+        f"Resume:\n{resume_text}\n\n"
+        f"Job Description:\n{job_text}\n"
+    )
 
     # Attempt 1
-    raw = call_model()
-    print("RAW GEMINI OUTPUT (1):\n", raw)
-
+    raw1 = _call_gemini(client, base_prompt, full_schema, max_tokens=450)
+    print("RAW GEMINI OUTPUT (1):\n", raw1)
     try:
-        return json.loads(raw)
+        return json.loads(raw1)
     except Exception:
-        # Attempt 2 (tighter)
-        raw = call_model("\nIMPORTANT: Output must be a complete JSON object. Do not stop early.\n")
-        print("RAW GEMINI OUTPUT (2):\n", raw)
-        return json.loads(raw)
+        pass
 
-# -------------------------------------------------
-# Analyze endpoint (GUARANTEED RESPONSE)
-# -------------------------------------------------
+    # Attempt 2 (stronger)
+    prompt2 = base_prompt + "\nIMPORTANT: Output must be COMPLETE valid JSON. Do not stop early.\n"
+    raw2 = _call_gemini(client, prompt2, full_schema, max_tokens=450)
+    print("RAW GEMINI OUTPUT (2):\n", raw2)
+    try:
+        return json.loads(raw2)
+    except Exception:
+        pass
+
+    # Attempt 3 (fallback: score only)
+    prompt3 = (
+        "Return JSON ONLY with exactly one key: match_score (0-100). "
+        "No other keys.\n\n"
+        f"Resume:\n{resume_text}\n\n"
+        f"Job Description:\n{job_text}\n"
+    )
+    raw3 = _call_gemini(client, prompt3, score_only_schema, max_tokens=60)
+    print("RAW GEMINI OUTPUT (3):\n", raw3)
+
+    score_obj = json.loads(raw3)
+    # Fill missing arrays so the frontend never breaks
+    return {
+        "match_score": score_obj.get("match_score", 0),
+        "missing_skills": [],
+        "key_strengths": [],
+        "improvement_suggestions": [
+            "Partial response: try again for full details."
+        ],
+    }
 
 @app.post("/analyze")
 def analyze_resume(payload: AnalyzeRequest):
