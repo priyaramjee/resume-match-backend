@@ -16,7 +16,7 @@ app = FastAPI(title="Resume Match API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # OK for MVP
+    allow_origins=["*"],  # OK for MVP
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -29,14 +29,22 @@ class AnalyzeRequest(BaseModel):
     resume_text: str
     job_text: str
 
+# -------------------------------------------------
+# Health check
+# -------------------------------------------------
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+# -------------------------------------------------
+# Thread pool (prevents blocking)
+# -------------------------------------------------
+
 executor = ThreadPoolExecutor(max_workers=2)
 
 # -------------------------------------------------
-# Gemini runner (schema-enforced JSON)
+# Gemini runner (schema JSON + retry on bad JSON)
 # -------------------------------------------------
 
 def run_gemini(resume_text: str, job_text: str) -> dict:
@@ -46,58 +54,71 @@ def run_gemini(resume_text: str, job_text: str) -> dict:
 
     client = genai.Client(api_key=api_key)
 
-    prompt = (
-        "You are an expert resume reviewer.\n\n"
-        "Compare the resume and the job description.\n\n"
-        "Return JSON ONLY. Keep it short.\n"
-        "Limits:\n"
-        "- missing_skills: max 5 items\n"
-        "- key_strengths: max 4 items\n"
-        "- improvement_suggestions: max 4 items\n"
-        "- Each item max 8 words\n\n"
-        f"Resume:\n{resume_text}\n\n"
-        f"Job Description:\n{job_text}\n"
+    schema = Schema(
+        type="object",
+        properties={
+            "match_score": Schema(type="number"),
+            "missing_skills": Schema(type="array", items=Schema(type="string")),
+            "key_strengths": Schema(type="array", items=Schema(type="string")),
+            "improvement_suggestions": Schema(type="array", items=Schema(type="string")),
+        },
+        required=[
+            "match_score",
+            "missing_skills",
+            "key_strengths",
+            "improvement_suggestions",
+        ],
     )
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=GenerateContentConfig(
-            temperature=0.2,
-            max_output_tokens=500,
-            response_mime_type="application/json",
-            response_schema=Schema(
-                type="object",
-                properties={
-                    "match_score": Schema(type="number"),
-                    "missing_skills": Schema(type="array", items=Schema(type="string")),
-                    "key_strengths": Schema(type="array", items=Schema(type="string")),
-                    "improvement_suggestions": Schema(type="array", items=Schema(type="string")),
-                },
-                required=[
-                    "match_score",
-                    "missing_skills",
-                    "key_strengths",
-                    "improvement_suggestions",
-                ],
+    def call_model(extra_instruction: str = "") -> str:
+        prompt = (
+            "You are an expert resume reviewer.\n\n"
+            "Compare the resume and the job description.\n\n"
+            "Return JSON ONLY.\n"
+            "Limits:\n"
+            "- missing_skills: max 5 items\n"
+            "- key_strengths: max 4 items\n"
+            "- improvement_suggestions: max 4 items\n"
+            "- Each item max 8 words\n"
+            + extra_instruction +
+            "\n\n"
+            f"Resume:\n{resume_text}\n\n"
+            f"Job Description:\n{job_text}\n"
+        )
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=500,
+                response_mime_type="application/json",
+                response_schema=schema,
             ),
-        ),
-    )
+        )
 
-    # Assemble text from candidates.parts (most robust)
-    raw = ""
-    for candidate in response.candidates:
-        for part in candidate.content.parts:
-            if getattr(part, "text", None):
-                raw += part.text
+        raw = ""
+        for candidate in response.candidates:
+            for part in candidate.content.parts:
+                if getattr(part, "text", None):
+                    raw += part.text
 
-    print("RAW GEMINI OUTPUT:\n", raw)
+        return raw.strip()
 
-    # Because response_mime_type is JSON, this should be valid JSON
-    return json.loads(raw)
+    # Attempt 1
+    raw = call_model()
+    print("RAW GEMINI OUTPUT (1):\n", raw)
+
+    try:
+        return json.loads(raw)
+    except Exception:
+        # Attempt 2 (tighter)
+        raw = call_model("\nIMPORTANT: Output must be a complete JSON object. Do not stop early.\n")
+        print("RAW GEMINI OUTPUT (2):\n", raw)
+        return json.loads(raw)
 
 # -------------------------------------------------
-# Analyze endpoint (never hangs, never breaks UI)
+# Analyze endpoint (GUARANTEED RESPONSE)
 # -------------------------------------------------
 
 @app.post("/analyze")
