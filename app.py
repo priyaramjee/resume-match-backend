@@ -4,10 +4,9 @@ from pydantic import BaseModel
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import os
 import json
-import re
 
 from google import genai
-from google.genai.types import GenerateContentConfig
+from google.genai.types import GenerateContentConfig, Schema
 
 # -------------------------------------------------
 # App setup
@@ -30,32 +29,14 @@ class AnalyzeRequest(BaseModel):
     resume_text: str
     job_text: str
 
-# -------------------------------------------------
-# Health check
-# -------------------------------------------------
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# -------------------------------------------------
-# Thread pool (prevents blocking)
-# -------------------------------------------------
-
 executor = ThreadPoolExecutor(max_workers=2)
 
 # -------------------------------------------------
-# Helper: robust JSON extraction
-# -------------------------------------------------
-
-def extract_json(text: str) -> dict:
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        raise ValueError("No JSON object found in Gemini output")
-    return json.loads(match.group())
-
-# -------------------------------------------------
-# Gemini runner (SAFE + COMPLETE)
+# Gemini runner (schema-enforced JSON)
 # -------------------------------------------------
 
 def run_gemini(resume_text: str, job_text: str) -> dict:
@@ -67,19 +48,15 @@ def run_gemini(resume_text: str, job_text: str) -> dict:
 
     prompt = (
         "You are an expert resume reviewer.\n\n"
-        "Compare the resume and job description below.\n\n"
-        "Return ONLY a valid JSON object.\n"
-        "Rules:\n"
-        "- match_score: number between 0 and 100\n"
+        "Compare the resume and the job description.\n\n"
+        "Return JSON ONLY. Keep it short.\n"
+        "Limits:\n"
         "- missing_skills: max 5 items\n"
-        "- key_strengths: max 5 items\n"
-        "- improvement_suggestions: max 5 items\n"
-        "- Use short phrases\n"
-        "- Do NOT add extra keys\n"
-        "- Do NOT add explanations\n"
-        "- Do NOT use markdown\n\n"
+        "- key_strengths: max 4 items\n"
+        "- improvement_suggestions: max 4 items\n"
+        "- Each item max 8 words\n\n"
         f"Resume:\n{resume_text}\n\n"
-        f"Job Description:\n{job_text}"
+        f"Job Description:\n{job_text}\n"
     )
 
     response = client.models.generate_content(
@@ -87,63 +64,75 @@ def run_gemini(resume_text: str, job_text: str) -> dict:
         contents=prompt,
         config=GenerateContentConfig(
             temperature=0.2,
-            max_output_tokens=1000
-        )
+            max_output_tokens=500,
+            response_mime_type="application/json",
+            response_schema=Schema(
+                type="object",
+                properties={
+                    "match_score": Schema(type="number"),
+                    "missing_skills": Schema(type="array", items=Schema(type="string")),
+                    "key_strengths": Schema(type="array", items=Schema(type="string")),
+                    "improvement_suggestions": Schema(type="array", items=Schema(type="string")),
+                },
+                required=[
+                    "match_score",
+                    "missing_skills",
+                    "key_strengths",
+                    "improvement_suggestions",
+                ],
+            ),
+        ),
     )
 
-    # IMPORTANT: assemble text from candidates.parts
+    # Assemble text from candidates.parts (most robust)
     raw = ""
     for candidate in response.candidates:
         for part in candidate.content.parts:
-            if hasattr(part, "text") and part.text:
+            if getattr(part, "text", None):
                 raw += part.text
 
     print("RAW GEMINI OUTPUT:\n", raw)
 
-    # Guard against truncation
-    if raw.count("{") != raw.count("}"):
-        raise RuntimeError("Incomplete JSON returned by Gemini")
-
-    return extract_json(raw)
+    # Because response_mime_type is JSON, this should be valid JSON
+    return json.loads(raw)
 
 # -------------------------------------------------
-# Analyze endpoint (GUARANTEED RESPONSE)
+# Analyze endpoint (never hangs, never breaks UI)
 # -------------------------------------------------
 
 @app.post("/analyze")
 def analyze_resume(payload: AnalyzeRequest):
-    future = executor.submit(
-        run_gemini,
-        payload.resume_text,
-        payload.job_text,
-    )
+    future = executor.submit(run_gemini, payload.resume_text, payload.job_text)
 
     try:
-        result = future.result(timeout=15)
+        result = future.result(timeout=20)
 
-        return {
-            "match_score": result.get("match_score", 0),
-            "missing_skills": result.get("missing_skills", []),
-            "key_strengths": result.get("key_strengths", []),
-            "improvement_suggestions": result.get("improvement_suggestions", []),
+        out = {
+            "match_score": float(result.get("match_score", 0)),
+            "missing_skills": result.get("missing_skills", []) or [],
+            "key_strengths": result.get("key_strengths", []) or [],
+            "improvement_suggestions": result.get("improvement_suggestions", []) or [],
         }
+
+        print("RETURNING TO CLIENT:", out)
+        return out
 
     except TimeoutError:
-        return {
+        out = {
             "match_score": 0,
             "missing_skills": [],
             "key_strengths": [],
-            "improvement_suggestions": [
-                "Analysis timed out. Please try again."
-            ],
+            "improvement_suggestions": ["Analysis timed out. Please try again."],
         }
+        print("RETURNING TO CLIENT (TIMEOUT):", out)
+        return out
 
     except Exception as e:
-        return {
+        out = {
             "match_score": 0,
             "missing_skills": [],
             "key_strengths": [],
-            "improvement_suggestions": [
-                f"Analysis failed: {str(e)}"
-            ],
+            "improvement_suggestions": [f"Analysis failed: {str(e)}"],
         }
+        print("RETURNING TO CLIENT (ERROR):", out)
+        return out
