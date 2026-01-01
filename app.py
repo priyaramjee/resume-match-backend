@@ -28,7 +28,7 @@ class AnalyzeRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "resume-match-backend"}
+    return {"status": "ok"}
 
 @app.get("/health")
 def health():
@@ -36,7 +36,7 @@ def health():
 
 @app.get("/version")
 def version():
-    return {"version": "retry-v4-json-safe-fallback"}
+    return {"version": "retry-v5-never-zero-on-glitch"}
 
 executor = ThreadPoolExecutor(max_workers=2)
 
@@ -44,16 +44,20 @@ executor = ThreadPoolExecutor(max_workers=2)
 # Helpers
 # -------------------------------------------------
 
-def _call_gemini(client, prompt: str, schema: Schema, max_tokens: int) -> str:
+def _call_gemini(client, prompt: str, schema: Schema | None, max_tokens: int) -> str:
+    # schema can be None; we still request JSON mime type
+    cfg_kwargs = dict(
+        temperature=0.2,
+        max_output_tokens=max_tokens,
+        response_mime_type="application/json",
+    )
+    if schema is not None:
+        cfg_kwargs["response_schema"] = schema
+
     response = client.models.generate_content(
         model="gemini-2.5-flash",
         contents=prompt,
-        config=GenerateContentConfig(
-            temperature=0.2,
-            max_output_tokens=max_tokens,
-            response_mime_type="application/json",
-            response_schema=schema,
-        ),
+        config=GenerateContentConfig(**cfg_kwargs),
     )
 
     raw = ""
@@ -64,10 +68,6 @@ def _call_gemini(client, prompt: str, schema: Schema, max_tokens: int) -> str:
     return raw.strip()
 
 def _safe_json_load(raw: str):
-    """
-    Try to parse JSON. Also tries to extract the first {...} object if there is extra text.
-    Returns dict or None.
-    """
     if not raw:
         return None
     raw = raw.strip()
@@ -78,27 +78,51 @@ def _safe_json_load(raw: str):
     except Exception:
         pass
 
-    # extract first json object
+    # extract first JSON object
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if m:
         try:
             return json.loads(m.group(0))
         except Exception:
             return None
+    return None
+
+def _extract_score_from_text(raw: str) -> float | None:
+    """
+    If Gemini returns text like "Here is { ... }" or "Here is 65",
+    extract a score safely.
+    """
+    if not raw:
+        return None
+
+    # Try JSON object first
+    obj = _safe_json_load(raw)
+    if obj and isinstance(obj, dict) and "match_score" in obj:
+        try:
+            return float(obj["match_score"])
+        except Exception:
+            return None
+
+    # Try regex score extraction
+    m = re.search(r"match_score\"\s*:\s*([0-9]+(?:\.[0-9]+)?)", raw)
+    if m:
+        return float(m.group(1))
+
+    # Any standalone number 0-100
+    m2 = re.search(r"\b([0-9]{1,3}(?:\.[0-9]+)?)\b", raw)
+    if m2:
+        val = float(m2.group(1))
+        if 0 <= val <= 100:
+            return val
 
     return None
 
 def _heuristic_score(resume_text: str, job_text: str) -> float:
-    """
-    Deterministic fallback score (never returns 0 unless both inputs are empty).
-    Simple keyword overlap ratio with guardrails.
-    """
     rt = (resume_text or "").lower()
     jt = (job_text or "").lower()
     if not rt.strip() and not jt.strip():
         return 0.0
 
-    # Common keywords for your use case (adjust anytime)
     keywords = [
         "sql", "databricks", "python", "cloud", "analytics", "manager", "leadership",
         "stakeholder", "dashboard", "finance", "operations", "spark", "azure", "team"
@@ -111,12 +135,11 @@ def _heuristic_score(resume_text: str, job_text: str) -> float:
     overlap = len(in_resume.intersection(in_job))
     ratio = overlap / max(len(in_job), 1)
 
-    # Map overlap ratio to a reasonable range
-    score = 40 + ratio * 55  # => 40..95
+    score = 40 + ratio * 55  # 40..95
     return round(min(max(score, 5.0), 95.0), 1)
 
 # -------------------------------------------------
-# Gemini runner (RETRY-V4)
+# Gemini runner (retry-v5)
 # -------------------------------------------------
 
 def run_gemini(resume_text: str, job_text: str) -> dict:
@@ -137,12 +160,6 @@ def run_gemini(resume_text: str, job_text: str) -> dict:
         required=["match_score", "missing_skills", "key_strengths", "improvement_suggestions"],
     )
 
-    score_only_schema = Schema(
-        type="object",
-        properties={"match_score": Schema(type="number")},
-        required=["match_score"],
-    )
-
     base_prompt = (
         "You are an expert resume reviewer.\n"
         "Return JSON ONLY.\n"
@@ -155,36 +172,35 @@ def run_gemini(resume_text: str, job_text: str) -> dict:
         f"Job Description:\n{job_text}\n"
     )
 
-    # Attempt 1
+    # Attempt 1: full JSON
     raw1 = _call_gemini(client, base_prompt, full_schema, 450)
     print("RAW GEMINI OUTPUT (1):\n", raw1)
     obj1 = _safe_json_load(raw1)
-    if obj1 and "match_score" in obj1:
+    if obj1 and isinstance(obj1, dict) and "match_score" in obj1:
         return obj1
 
-    # Attempt 2 (stronger)
+    # Attempt 2: stronger full JSON
     prompt2 = base_prompt + "\nIMPORTANT: Output must be COMPLETE valid JSON. Do not stop early.\n"
     raw2 = _call_gemini(client, prompt2, full_schema, 450)
     print("RAW GEMINI OUTPUT (2):\n", raw2)
     obj2 = _safe_json_load(raw2)
-    if obj2 and "match_score" in obj2:
+    if obj2 and isinstance(obj2, dict) and "match_score" in obj2:
         return obj2
 
-    # Attempt 3 (score-only strict)
+    # Attempt 3: score-only (schema sometimes ignored, so we parse robustly)
     prompt3 = (
-        "RETURN ONLY JSON. No words.\n"
-        "Output exactly like this example: {\"match_score\": 72}\n"
-        "No extra keys.\n\n"
+        "RETURN ONLY JSON. NO extra text.\n"
+        "Output exactly: {\"match_score\": 72}\n\n"
         f"Resume:\n{resume_text}\n\n"
         f"Job Description:\n{job_text}\n"
     )
-    raw3 = _call_gemini(client, prompt3, score_only_schema, 80)
+    raw3 = _call_gemini(client, prompt3, None, 80)  # schema=None on purpose
     print("RAW GEMINI OUTPUT (3):\n", raw3)
-    obj3 = _safe_json_load(raw3)
 
-    if obj3 and "match_score" in obj3:
+    score = _extract_score_from_text(raw3)
+    if score is not None:
         return {
-            "match_score": obj3.get("match_score", 0),
+            "match_score": float(score),
             "missing_skills": [],
             "key_strengths": [],
             "improvement_suggestions": ["Partial response returned. Re-run for full analysis."],
@@ -193,7 +209,7 @@ def run_gemini(resume_text: str, job_text: str) -> dict:
     # Final deterministic fallback (never break UI)
     score = _heuristic_score(resume_text, job_text)
     return {
-        "match_score": score,
+        "match_score": float(score),
         "missing_skills": [],
         "key_strengths": [],
         "improvement_suggestions": [
@@ -203,7 +219,7 @@ def run_gemini(resume_text: str, job_text: str) -> dict:
     }
 
 # -------------------------------------------------
-# Analyze endpoint
+# Analyze endpoint (never returns 0 on glitch)
 # -------------------------------------------------
 
 @app.post("/analyze")
@@ -219,26 +235,25 @@ def analyze_resume(payload: AnalyzeRequest):
             "key_strengths": result.get("key_strengths", []) or [],
             "improvement_suggestions": result.get("improvement_suggestions", []) or [],
         }
-
         print("RETURNING TO CLIENT:", out)
         return out
 
     except TimeoutError:
         out = {
-            "match_score": 0,
+            "match_score": _heuristic_score(payload.resume_text, payload.job_text),
             "missing_skills": [],
             "key_strengths": [],
-            "improvement_suggestions": ["Analysis timed out. Please try again."],
+            "improvement_suggestions": ["Timed out. Showing estimated score; retry for full analysis."],
         }
         print("RETURNING TO CLIENT (TIMEOUT):", out)
         return out
 
     except Exception as e:
         out = {
-            "match_score": 0,
+            "match_score": _heuristic_score(payload.resume_text, payload.job_text),
             "missing_skills": [],
             "key_strengths": [],
-            "improvement_suggestions": [f"Analysis failed: {str(e)}"],
+            "improvement_suggestions": [f"Temporary error: {str(e)}", "Retry for full analysis."],
         }
         print("RETURNING TO CLIENT (ERROR):", out)
         return out
