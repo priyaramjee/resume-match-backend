@@ -149,72 +149,139 @@ def run_gemini(resume_text: str, job_text: str) -> dict:
 
     client = genai.Client(api_key=api_key)
 
-    full_schema = Schema(
+    skills_schema = Schema(
         type="object",
         properties={
-            "match_score": Schema(type="number"),
+            "must_have_skills": Schema(type="array", items=Schema(type="string")),
+            "nice_to_have_skills": Schema(type="array", items=Schema(type="string")),
+            "matched_skills": Schema(type="array", items=Schema(type="string")),
             "missing_skills": Schema(type="array", items=Schema(type="string")),
-            "key_strengths": Schema(type="array", items=Schema(type="string")),
+            "skill_evidence": Schema(
+                type="array",
+                items=Schema(
+                    type="object",
+                    properties={
+                        "skill": Schema(type="string"),
+                        "category": Schema(type="string"),  # must_have | nice_to_have
+                        "status": Schema(type="string"),    # matched | missing
+                        "evidence": Schema(type="string"),
+                    },
+                    required=["skill", "category", "status", "evidence"],
+                ),
+            ),
             "improvement_suggestions": Schema(type="array", items=Schema(type="string")),
         },
-        required=["match_score", "missing_skills", "key_strengths", "improvement_suggestions"],
+        required=[
+            "must_have_skills",
+            "nice_to_have_skills",
+            "matched_skills",
+            "missing_skills",
+            "skill_evidence",
+            "improvement_suggestions",
+        ],
     )
 
     base_prompt = (
         "You are an expert resume reviewer.\n"
-        "Return JSON ONLY.\n"
-        "Limits:\n"
-        "- missing_skills: max 5 items\n"
-        "- key_strengths: max 4 items\n"
-        "- improvement_suggestions: max 4 items\n"
-        "- Each item max 8 words\n\n"
-        f"Resume:\n{resume_text}\n\n"
-        f"Job Description:\n{job_text}\n"
+        "Return JSON ONLY.\n\n"
+        "Task:\n"
+        "1) From the JOB DESCRIPTION, extract:\n"
+        "   - must_have_skills (6-12)\n"
+        "   - nice_to_have_skills (0-8)\n"
+        "2) Compare RESUME vs JOB and produce:\n"
+        "   - matched_skills (subset of must/nice)\n"
+        "   - missing_skills (subset of must/nice)\n"
+        "   - skill_evidence: for EACH skill in must_have_skills and nice_to_have_skills,\n"
+        "     include: skill, category (must_have/nice_to_have), status (matched/missing), evidence.\n\n"
+        "Evidence rules:\n"
+        "- evidence must be <= 12 words\n"
+        "- use short paraphrase of resume/job text\n\n"
+        "Rules:\n"
+        "- Use consistent skill names in Title Case\n"
+        "- Do NOT invent skills not present in the job description\n"
+        "- improvement_suggestions: max 5 items\n\n"
+        f"RESUME:\n{resume_text}\n\n"
+        f"JOB DESCRIPTION:\n{job_text}\n"
     )
 
-    # Attempt 1: full JSON
-    raw1 = _call_gemini(client, base_prompt, full_schema, 450)
+    # Attempt 1
+    raw1 = _call_gemini(client, base_prompt, skills_schema, 900)
     print("RAW GEMINI OUTPUT (1):\n", raw1)
     obj1 = _safe_json_load(raw1)
-    if obj1 and isinstance(obj1, dict) and "match_score" in obj1:
+    if obj1 and isinstance(obj1, dict) and "must_have_skills" in obj1:
         return obj1
 
-    # Attempt 2: stronger full JSON
-    prompt2 = base_prompt + "\nIMPORTANT: Output must be COMPLETE valid JSON. Do not stop early.\n"
-    raw2 = _call_gemini(client, prompt2, full_schema, 450)
+    # Attempt 2 stronger
+    prompt2 = base_prompt + "\nIMPORTANT: Output must be COMPLETE valid JSON. No extra text.\n"
+    raw2 = _call_gemini(client, prompt2, skills_schema, 900)
     print("RAW GEMINI OUTPUT (2):\n", raw2)
     obj2 = _safe_json_load(raw2)
-    if obj2 and isinstance(obj2, dict) and "match_score" in obj2:
+    if obj2 and isinstance(obj2, dict) and "must_have_skills" in obj2:
         return obj2
 
-    # Attempt 3: score-only (schema sometimes ignored, so we parse robustly)
-    prompt3 = (
-        "RETURN ONLY JSON. NO extra text.\n"
-        "Output exactly: {\"match_score\": 72}\n\n"
-        f"Resume:\n{resume_text}\n\n"
-        f"Job Description:\n{job_text}\n"
+    # Attempt 3: minimal skills-only (sometimes helps when output gets truncated)
+    minimal_schema = Schema(
+        type="object",
+        properties={
+            "must_have_skills": Schema(type="array", items=Schema(type="string")),
+            "nice_to_have_skills": Schema(type="array", items=Schema(type="string")),
+            "matched_skills": Schema(type="array", items=Schema(type="string")),
+            "missing_skills": Schema(type="array", items=Schema(type="string")),
+        },
+        required=["must_have_skills", "nice_to_have_skills", "matched_skills", "missing_skills"],
     )
-    raw3 = _call_gemini(client, prompt3, None, 80)  # schema=None on purpose
-    print("RAW GEMINI OUTPUT (3):\n", raw3)
 
-    score = _extract_score_from_text(raw3)
-    if score is not None:
+    prompt3 = (
+        "Return JSON ONLY. No extra text.\n"
+        "Return only these keys:\n"
+        "must_have_skills, nice_to_have_skills, matched_skills, missing_skills\n\n"
+        f"RESUME:\n{resume_text}\n\n"
+        f"JOB DESCRIPTION:\n{job_text}\n"
+    )
+    raw3 = _call_gemini(client, prompt3, minimal_schema, 350)
+    print("RAW GEMINI OUTPUT (3):\n", raw3)
+    obj3 = _safe_json_load(raw3)
+
+    if obj3 and isinstance(obj3, dict) and "must_have_skills" in obj3:
+        # synthesize skill_evidence minimally so frontend still works
+        must = obj3.get("must_have_skills", []) or []
+        nice = obj3.get("nice_to_have_skills", []) or []
+        matched = {s.lower() for s in (obj3.get("matched_skills", []) or [])}
+
+        evidence = []
+        for s in must:
+            evidence.append({
+                "skill": s,
+                "category": "must_have",
+                "status": "matched" if isinstance(s, str) and s.lower() in matched else "missing",
+                "evidence": "Derived from resume/job comparison",
+            })
+        for s in nice:
+            evidence.append({
+                "skill": s,
+                "category": "nice_to_have",
+                "status": "matched" if isinstance(s, str) and s.lower() in matched else "missing",
+                "evidence": "Derived from resume/job comparison",
+            })
+
         return {
-            "match_score": float(score),
-            "missing_skills": [],
-            "key_strengths": [],
-            "improvement_suggestions": ["Partial response returned. Re-run for full analysis."],
+            "must_have_skills": must,
+            "nice_to_have_skills": nice,
+            "matched_skills": obj3.get("matched_skills", []) or [],
+            "missing_skills": obj3.get("missing_skills", []) or [],
+            "skill_evidence": evidence,
+            "improvement_suggestions": ["Re-run to get richer evidence text."],
         }
 
-    # Final deterministic fallback (never break UI)
-    score = _heuristic_score(resume_text, job_text)
+    # Final fallback: return empty structured object (so /analyze can still compute)
     return {
-        "match_score": float(score),
+        "must_have_skills": [],
+        "nice_to_have_skills": [],
+        "matched_skills": [],
         "missing_skills": [],
-        "key_strengths": [],
+        "skill_evidence": [],
         "improvement_suggestions": [
-            "Temporary model issue. Score estimated from keyword overlap.",
-            "Re-run for full analysis."
+            "Temporary model issue. Please try again."
         ],
     }
 
