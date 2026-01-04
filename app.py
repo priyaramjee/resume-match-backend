@@ -174,12 +174,73 @@ def run_gemini(resume_text: str, job_text: str) -> Dict[str, Any]:
 
     client = genai.Client(api_key=api_key)
 
-    # compact schema to reduce output size; evidence only for must-haves
-    skills_schema = Schema(
+    def _strip_code_fences(s: str) -> str:
+        if not s or not isinstance(s, str):
+            return s
+        s = s.strip()
+        # remove ```json ... ```
+        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s*```$", "", s)
+        return s.strip()
+
+    def _try_parse_any(raw: str) -> Optional[Dict[str, Any]]:
+        if not raw:
+            return None
+        raw = _strip_code_fences(raw)
+        obj = _safe_json_load(raw)
+        if obj:
+            return obj
+        # try extracting JSON object from mixed text
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            return _safe_json_load(m.group(0))
+        return None
+
+    # -------- Step A: extract ONLY skill lists (tiny output) --------
+    list_schema = Schema(
         type="object",
         properties={
             "must_have_skills": Schema(type="array", items=Schema(type="string")),
             "nice_to_have_skills": Schema(type="array", items=Schema(type="string")),
+        },
+        required=["must_have_skills", "nice_to_have_skills"],
+    )
+
+    prompt_a = (
+        "Return JSON ONLY.\n"
+        "Extract skills as short nouns (1-3 words). No long phrases.\n"
+        "Output exactly two keys: must_have_skills, nice_to_have_skills.\n"
+        "Limits: must_have_skills 5-8 items; nice_to_have_skills 0-4 items.\n\n"
+        f"JOB DESCRIPTION:\n{job_text}\n"
+    )
+
+    raw_a1 = _call_gemini(client, prompt_a, list_schema, 220)
+    print("RAW GEMINI SKILL LIST (A1):\n", raw_a1)
+    obj_a = _try_parse_any(raw_a1)
+
+    if not (obj_a and isinstance(obj_a, dict) and "must_have_skills" in obj_a):
+        raw_a2 = _call_gemini(client, prompt_a + "\nNO markdown. NO extra text.\n", list_schema, 220)
+        print("RAW GEMINI SKILL LIST (A2):\n", raw_a2)
+        obj_a = _try_parse_any(raw_a2)
+
+    if not (obj_a and isinstance(obj_a, dict) and "must_have_skills" in obj_a):
+        # can't even get skill lists
+        return {
+            "must_have_skills": [],
+            "nice_to_have_skills": [],
+            "matched_skills": [],
+            "missing_skills": [],
+            "skill_evidence": [],
+            "improvement_suggestions": ["Temporary model issue. Please try again."],
+        }
+
+    must = _dedupe_str_list(obj_a.get("must_have_skills", []))
+    nice = _dedupe_str_list(obj_a.get("nice_to_have_skills", []))
+
+    # -------- Step B: classify matched vs missing (tiny output) --------
+    classify_schema = Schema(
+        type="object",
+        properties={
             "matched_skills": Schema(type="array", items=Schema(type="string")),
             "missing_skills": Schema(type="array", items=Schema(type="string")),
             "skill_evidence": Schema(
@@ -197,120 +258,59 @@ def run_gemini(resume_text: str, job_text: str) -> Dict[str, Any]:
             ),
             "improvement_suggestions": Schema(type="array", items=Schema(type="string")),
         },
-        required=[
-            "must_have_skills",
-            "nice_to_have_skills",
-            "matched_skills",
-            "missing_skills",
-            "skill_evidence",
-            "improvement_suggestions",
-        ],
+        required=["matched_skills", "missing_skills", "skill_evidence", "improvement_suggestions"],
     )
 
-    base_prompt = (
-        "You are an expert resume reviewer.\n"
-        "Return JSON ONLY. No markdown. No extra text.\n\n"
-        "Extract skills as short nouns (1-3 words). Avoid long phrases.\n\n"
-        "From the JOB DESCRIPTION, output:\n"
-        "- must_have_skills: 5-8 items\n"
-        "- nice_to_have_skills: 0-4 items\n\n"
-        "Compare RESUME vs JOB and output:\n"
-        "- matched_skills: subset of must/nice\n"
-        "- missing_skills: subset of must/nice\n\n"
-        "skill_evidence rules:\n"
-        "- Include evidence ONLY for must_have_skills\n"
-        "- Each item: {skill, category:\"must_have\", status:\"matched\"|\"missing\", evidence}\n"
-        "- evidence <= 10 words\n\n"
-        "improvement_suggestions: max 4 short items\n\n"
-        f"RESUME:\n{resume_text}\n\n"
-        f"JOB DESCRIPTION:\n{job_text}\n"
+    prompt_b = (
+        "Return JSON ONLY.\n"
+        "Given the skill lists (from the job) decide if each must-have is matched in the resume.\n"
+        "Rules:\n"
+        "- matched_skills and missing_skills must only use skills from the provided lists.\n"
+        "- skill_evidence must include ONLY must-have skills.\n"
+        "- category must be exactly: must_have\n"
+        "- status must be exactly: matched or missing\n"
+        "- evidence <= 10 words (short quote/paraphrase)\n"
+        "- improvement_suggestions: max 4\n\n"
+        f"MUST_HAVE_SKILLS:\n{json.dumps(must)}\n\n"
+        f"NICE_TO_HAVE_SKILLS:\n{json.dumps(nice)}\n\n"
+        f"RESUME:\n{resume_text}\n"
     )
 
-    # Attempt 1
-    raw1 = _call_gemini(client, base_prompt, skills_schema, 650)
-    print("RAW GEMINI OUTPUT (1):\n", raw1)
+    raw_b1 = _call_gemini(client, prompt_b, classify_schema, 350)
+    print("RAW GEMINI CLASSIFY (B1):\n", raw_b1)
+    obj_b = _try_parse_any(raw_b1)
 
-    obj1 = None
-    if not _looks_truncated(raw1):
-        obj1 = _safe_json_load(raw1)
-    if obj1 and isinstance(obj1, dict) and "must_have_skills" in obj1:
-        return obj1
+    if not (obj_b and isinstance(obj_b, dict) and "matched_skills" in obj_b):
+        raw_b2 = _call_gemini(client, prompt_b + "\nNO markdown. NO extra text.\n", classify_schema, 350)
+        print("RAW GEMINI CLASSIFY (B2):\n", raw_b2)
+        obj_b = _try_parse_any(raw_b2)
 
-    # Attempt 2 stronger
-    prompt2 = base_prompt + "\nIMPORTANT: Output must be COMPLETE valid JSON. No extra text.\n"
-    raw2 = _call_gemini(client, prompt2, skills_schema, 650)
-    print("RAW GEMINI OUTPUT (2):\n", raw2)
-
-    obj2 = None
-    if not _looks_truncated(raw2):
-        obj2 = _safe_json_load(raw2)
-    if obj2 and isinstance(obj2, dict) and "must_have_skills" in obj2:
-        return obj2
-
-    # Attempt 3 minimal (very small output)
-    minimal_schema = Schema(
-        type="object",
-        properties={
-            "must_have_skills": Schema(type="array", items=Schema(type="string")),
-            "nice_to_have_skills": Schema(type="array", items=Schema(type="string")),
-            "matched_skills": Schema(type="array", items=Schema(type="string")),
-            "missing_skills": Schema(type="array", items=Schema(type="string")),
-        },
-        required=["must_have_skills", "nice_to_have_skills", "matched_skills", "missing_skills"],
-    )
-
-    prompt3 = (
-        "Return JSON ONLY. No extra text.\n"
-        "Skills must be short nouns (1-3 words).\n"
-        "Return ONLY keys: must_have_skills, nice_to_have_skills, matched_skills, missing_skills\n\n"
-        f"RESUME:\n{resume_text}\n\n"
-        f"JOB DESCRIPTION:\n{job_text}\n"
-    )
-
-    raw3 = _call_gemini(client, prompt3, minimal_schema, 250)
-    print("RAW GEMINI OUTPUT (3):\n", raw3)
-
-    obj3 = None
-    if not _looks_truncated(raw3):
-        obj3 = _safe_json_load(raw3)
-
-    if obj3 and isinstance(obj3, dict) and "must_have_skills" in obj3:
-        must = _dedupe_str_list(obj3.get("must_have_skills", []))
-        nice = _dedupe_str_list(obj3.get("nice_to_have_skills", []))
-        matched_list = _dedupe_str_list(obj3.get("matched_skills", []))
-        missing_list = _dedupe_str_list(obj3.get("missing_skills", []))
-
-        matched_set = {s.lower() for s in matched_list}
-
-        # synthesize minimal evidence for must-have only
-        evidence = []
-        for s in must:
-            evidence.append({
-                "skill": s,
-                "category": "must_have",
-                "status": "matched" if s.lower() in matched_set else "missing",
-                "evidence": "Derived from resume/job comparison",
-            })
-
+    if not (obj_b and isinstance(obj_b, dict) and "matched_skills" in obj_b):
+        # fallback: return lists only, minimal evidence
+        matched_set = {s.lower() for s in _dedupe_str_list([])}
+        evidence = [{"skill": s, "category": "must_have", "status": "missing", "evidence": "No parse"} for s in must]
         return {
             "must_have_skills": must,
             "nice_to_have_skills": nice,
-            "matched_skills": matched_list,
-            "missing_skills": missing_list,
+            "matched_skills": [],
+            "missing_skills": must + nice,
             "skill_evidence": evidence,
-            "improvement_suggestions": ["Re-run for richer evidence text."],
+            "improvement_suggestions": ["Re-run. Model returned non-JSON output."],
         }
 
-    # Final fallback
-    return {
-        "must_have_skills": [],
-        "nice_to_have_skills": [],
-        "matched_skills": [],
-        "missing_skills": [],
-        "skill_evidence": [],
-        "improvement_suggestions": ["Temporary model issue. Please try again."],
-    }
+    matched = _dedupe_str_list(obj_b.get("matched_skills", []))
+    missing = _dedupe_str_list(obj_b.get("missing_skills", []))
+    evidence = obj_b.get("skill_evidence", []) or []
+    suggestions = _dedupe_str_list(obj_b.get("improvement_suggestions", []))[:4]
 
+    return {
+        "must_have_skills": must,
+        "nice_to_have_skills": nice,
+        "matched_skills": matched,
+        "missing_skills": missing,
+        "skill_evidence": evidence,
+        "improvement_suggestions": suggestions,
+    }
 # -------------------------------------------------
 # Analyze endpoint: EXPLAINABLE SCORE (deterministic)
 # -------------------------------------------------
