@@ -37,7 +37,7 @@ def health():
 
 @app.get("/version")
 def version():
-    return {"version": "skills-v2-safe-call + anti-truncation + explainable-score"}
+    return {"version": "skills-v3-stop-seq + repair-fallback + explainable-score"}
 
 executor = ThreadPoolExecutor(max_workers=2)
 
@@ -85,32 +85,39 @@ def _safe_json_load(raw: str) -> Optional[Dict[str, Any]]:
             return None
     return None
 
-def _looks_truncated(raw: str) -> bool:
+def _strip_code_fences(s: str) -> str:
+    if not s or not isinstance(s, str):
+        return s
+    s = s.strip()
+    # remove ```json ... ```
+    s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*```$", "", s)
+    return s.strip()
+
+def _try_parse_any(raw: str) -> Optional[Dict[str, Any]]:
     if not raw or not isinstance(raw, str):
-        return True
-    raw = raw.strip()
-    if not raw:
-        return True
-    # JSON/object/array not closed
-    if raw.count("{") > raw.count("}"):
-        return True
-    if raw.count("[") > raw.count("]"):
-        return True
-    # common truncation endings
-    if raw.endswith((",", ":", '"')):
-        return True
-    return False
+        return None
+    raw = _strip_code_fences(raw)
+    obj = _safe_json_load(raw)
+    if obj and isinstance(obj, dict):
+        return obj
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        return _safe_json_load(m.group(0))
+    return None
 
 def _call_gemini(client, prompt: str, schema: Optional[Schema], max_tokens: int) -> str:
     """
     Safe Gemini call:
-    - Handles cases where response.candidates is None
+    - Handles cases where response.candidates is None/empty
+    - Uses stop sequences to reduce preambles like "Here is the JSON..."
     - Falls back to response.text if available
     """
     cfg_kwargs = dict(
-        temperature=0.2,
+        temperature=0.0,  # stronger compliance
         max_output_tokens=max_tokens,
         response_mime_type="application/json",
+        stop_sequences=["\n\nHere is", "Here is", "```"],
     )
     if schema is not None:
         cfg_kwargs["response_schema"] = schema
@@ -134,13 +141,40 @@ def _call_gemini(client, prompt: str, schema: Optional[Schema], max_tokens: int)
 
     raw = "".join(raw_parts).strip()
 
-    # fallback to response.text if parts empty
+    # fallback to response.text
     if not raw:
         txt = getattr(response, "text", None)
         if isinstance(txt, str) and txt.strip():
             raw = txt.strip()
 
+    if not raw:
+        print("DEBUG: Gemini returned empty text. candidates_len=", len(candidates))
+
     return raw
+
+def _ensure_json_via_repair(client, raw_text: str, target_schema: Schema) -> Optional[Dict[str, Any]]:
+    """
+    If Gemini returns non-JSON like 'Here is the JSON requested', run a tiny repair prompt
+    that outputs strict JSON ONLY (or an empty valid JSON object).
+    """
+    if not raw_text or not isinstance(raw_text, str):
+        raw_text = ""
+
+    repair_prompt = (
+        "Return JSON ONLY. No extra text.\n"
+        "Convert the following text into valid JSON that matches the required schema.\n"
+        "If the text does not contain JSON, output an empty valid JSON object that matches schema defaults.\n\n"
+        f"TEXT:\n{raw_text}\n"
+    )
+
+    raw = _call_gemini(client, repair_prompt, target_schema, 250)
+    raw = (raw or "").strip()
+
+    obj = _try_parse_any(raw)
+    if obj and isinstance(obj, dict):
+        return obj
+
+    return None
 
 def _heuristic_score(resume_text: str, job_text: str) -> float:
     rt = (resume_text or "").lower()
@@ -164,7 +198,7 @@ def _heuristic_score(resume_text: str, job_text: str) -> float:
     return round(min(max(score, 5.0), 95.0), 1)
 
 # -------------------------------------------------
-# Gemini runner: SKILLS + EVIDENCE (compact to avoid truncation)
+# Gemini runner: two-step (lists -> classify) + repair fallback
 # -------------------------------------------------
 
 def run_gemini(resume_text: str, job_text: str) -> Dict[str, Any]:
@@ -173,28 +207,6 @@ def run_gemini(resume_text: str, job_text: str) -> Dict[str, Any]:
         raise RuntimeError("GEMINI_API_KEY not set")
 
     client = genai.Client(api_key=api_key)
-
-    def _strip_code_fences(s: str) -> str:
-        if not s or not isinstance(s, str):
-            return s
-        s = s.strip()
-        # remove ```json ... ```
-        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
-        s = re.sub(r"\s*```$", "", s)
-        return s.strip()
-
-    def _try_parse_any(raw: str) -> Optional[Dict[str, Any]]:
-        if not raw:
-            return None
-        raw = _strip_code_fences(raw)
-        obj = _safe_json_load(raw)
-        if obj:
-            return obj
-        # try extracting JSON object from mixed text
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if m:
-            return _safe_json_load(m.group(0))
-        return None
 
     # -------- Step A: extract ONLY skill lists (tiny output) --------
     list_schema = Schema(
@@ -207,8 +219,8 @@ def run_gemini(resume_text: str, job_text: str) -> Dict[str, Any]:
     )
 
     prompt_a = (
-        "Return JSON ONLY.\n"
-        "Extract skills as short nouns (1-3 words). No long phrases.\n"
+        "Return JSON ONLY. No extra text.\n"
+        "Extract skills as short nouns (1-3 words). Avoid long phrases.\n"
         "Output exactly two keys: must_have_skills, nice_to_have_skills.\n"
         "Limits: must_have_skills 5-8 items; nice_to_have_skills 0-4 items.\n\n"
         f"JOB DESCRIPTION:\n{job_text}\n"
@@ -223,8 +235,13 @@ def run_gemini(resume_text: str, job_text: str) -> Dict[str, Any]:
         print("RAW GEMINI SKILL LIST (A2):\n", raw_a2)
         obj_a = _try_parse_any(raw_a2)
 
+        # Repair fallback
+        if not (obj_a and isinstance(obj_a, dict) and "must_have_skills" in obj_a):
+            repaired = _ensure_json_via_repair(client, raw_a2 or raw_a1, list_schema)
+            if repaired and "must_have_skills" in repaired:
+                obj_a = repaired
+
     if not (obj_a and isinstance(obj_a, dict) and "must_have_skills" in obj_a):
-        # can't even get skill lists
         return {
             "must_have_skills": [],
             "nice_to_have_skills": [],
@@ -262,14 +279,13 @@ def run_gemini(resume_text: str, job_text: str) -> Dict[str, Any]:
     )
 
     prompt_b = (
-        "Return JSON ONLY.\n"
-        "Given the skill lists (from the job) decide if each must-have is matched in the resume.\n"
+        "Return JSON ONLY. No extra text.\n"
+        "Using the skill lists from the job, decide which are matched in the resume.\n"
         "Rules:\n"
         "- matched_skills and missing_skills must only use skills from the provided lists.\n"
-        "- skill_evidence must include ONLY must-have skills.\n"
-        "- category must be exactly: must_have\n"
-        "- status must be exactly: matched or missing\n"
-        "- evidence <= 10 words (short quote/paraphrase)\n"
+        "- skill_evidence must include ONLY must_have skills.\n"
+        "- For each must-have: {skill, category:\"must_have\", status:\"matched\"|\"missing\", evidence}\n"
+        "- evidence <= 10 words\n"
         "- improvement_suggestions: max 4\n\n"
         f"MUST_HAVE_SKILLS:\n{json.dumps(must)}\n\n"
         f"NICE_TO_HAVE_SKILLS:\n{json.dumps(nice)}\n\n"
@@ -285,9 +301,14 @@ def run_gemini(resume_text: str, job_text: str) -> Dict[str, Any]:
         print("RAW GEMINI CLASSIFY (B2):\n", raw_b2)
         obj_b = _try_parse_any(raw_b2)
 
+        # Repair fallback
+        if not (obj_b and isinstance(obj_b, dict) and "matched_skills" in obj_b):
+            repaired_b = _ensure_json_via_repair(client, raw_b2 or raw_b1, classify_schema)
+            if repaired_b and "matched_skills" in repaired_b:
+                obj_b = repaired_b
+
     if not (obj_b and isinstance(obj_b, dict) and "matched_skills" in obj_b):
         # fallback: return lists only, minimal evidence
-        matched_set = {s.lower() for s in _dedupe_str_list([])}
         evidence = [{"skill": s, "category": "must_have", "status": "missing", "evidence": "No parse"} for s in must]
         return {
             "must_have_skills": must,
@@ -311,8 +332,9 @@ def run_gemini(resume_text: str, job_text: str) -> Dict[str, Any]:
         "skill_evidence": evidence,
         "improvement_suggestions": suggestions,
     }
+
 # -------------------------------------------------
-# Analyze endpoint: EXPLAINABLE SCORE (deterministic)
+# Analyze endpoint: explainable deterministic scoring
 # -------------------------------------------------
 
 @app.post("/analyze")
@@ -320,7 +342,7 @@ def analyze_resume(payload: AnalyzeRequest):
     future = executor.submit(run_gemini, payload.resume_text, payload.job_text)
 
     try:
-        result = future.result(timeout=25) or {}
+        result = future.result(timeout=30) or {}
 
         must = _dedupe_str_list(result.get("must_have_skills", []))
         nice = _dedupe_str_list(result.get("nice_to_have_skills", []))
@@ -342,6 +364,11 @@ def analyze_resume(payload: AnalyzeRequest):
 
         score = 100.0 * (weights["must_have"] * must_ratio + weights["nice_to_have"] * nice_ratio)
         score_int = int(round(min(max(score, 0.0), 100.0)))
+
+        # if model failed to produce skills, fall back to heuristic score (never 0 unless input empty)
+        if must_total == 0 and nice_total == 0:
+            score_int = int(round(_heuristic_score(payload.resume_text, payload.job_text)))
+            suggestions = suggestions or ["Model output was not JSON; showing estimated score. Retry."]
 
         out = {
             "match_score": score_int,
